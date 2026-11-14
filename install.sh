@@ -13,6 +13,7 @@ state=${XDG_STATE_HOME:-$HOME/.local/state}/rex-undo
 hook="sh \"$root/hooks/claude-session-start.sh\""
 key=${REX_UNDO_KEY:-cmd+shift+t}
 history=${REX_UNDO_HISTORY:-50}
+restart=${REX_UNDO_RESTART:-all}
 again=$(ui_arg "$root/install.sh")
 
 # Rex's installer doesn't always put rex on PATH, so fall back to where Rex keeps it.
@@ -34,6 +35,15 @@ if [ "$n" -lt 1 ]; then
   ui_next "Install with a number of closes to keep" "REX_UNDO_HISTORY=100 $again"
   exit 1
 fi
+
+case $restart in
+  all | agents) restart_lua="\"$restart\"" ;;
+  off) restart_lua=false ;;
+  *)
+    ui_err "REX_UNDO_RESTART must be all, agents, or off, not '$restart'."
+    ui_next "Install without restoring programs after a server restart" "REX_UNDO_RESTART=off $again"
+    exit 1 ;;
+esac
 
 mkdir -p "$(dirname "$config")"
 # Replace an earlier block, which may point at a folder from another install or Mac.
@@ -57,6 +67,7 @@ do
       rex = "$rex",
       key = "$key",
       history = $history,
+      restart = $restart_lua,
     }
   end)
   if not ok then rex.log("rex-undo: not loaded: " .. tostring(err)) end
@@ -100,6 +111,11 @@ fi
 ui_ok "$verb" rex-undo
 ui_row "Key" "$key reopens the last close"
 ui_row "History" "last $history closes"
+case $restart in
+  all) ui_row "Server restart" "agents resume, other commands are typed" ;;
+  agents) ui_row "Server restart" "agents resume" ;;
+  off) ui_row "Server restart" "nothing comes back" ;;
+esac
 if [ -n "$watcher" ]; then ui_row "Watcher" "running"; fi
 ui_row "Rex config" "$(ui_path "$config")"
 if [ -n "$hook_ok" ]; then

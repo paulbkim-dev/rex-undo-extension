@@ -9,6 +9,7 @@ M.stack_path = M.state_dir .. "/stack.jsonl"
 M.old_stack_path = M.state_dir .. "/stack.json" -- one JSON array, before 2026-11
 M.remap_path = M.state_dir .. "/remap.json"
 M.settling_path = M.state_dir .. "/settling" -- there while the watcher settles a close
+M.save_path = M.state_dir .. "/save.json" -- what runs in every pane, for after a server restart
 M.max_entries = 50 -- unless settings.json, written by undo.lua's setup, says otherwise
 M.settings_path = M.state_dir .. "/settings.json"
 M.remap_max = 100

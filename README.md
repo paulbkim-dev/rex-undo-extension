@@ -11,6 +11,13 @@ with whatever was running in it. Press `cmd+shift+t`.
 Panes return to the same side of the same split, tabs to the same place in the tab bar,
 and sessions with every tab.
 
+After the Rex server restarts, rex-undo also brings back what ran in each pane: every
+agent resumes its own conversation, and any other command is typed at the prompt for you
+to run. See [After a server restart](#after-a-server-restart).
+
+This is a fork of [lakshaybhushan/rex-undo-extension](https://github.com/lakshaybhushan/rex-undo-extension)
+that adds Linux support and the restart behavior. See [Credits](#credits).
+
 ## Install
 
 rex-undo runs on macOS and Linux. It needs Rex, and `jq` for the Claude hook:
@@ -36,6 +43,7 @@ a move, Rex logs `rex-undo: not loaded` and loads the rest of the config.
 | --- | --- | --- |
 | `REX_UNDO_KEY` | `cmd+shift+t` | Key that reopens the most recent close |
 | `REX_UNDO_HISTORY` | `50` | Closes to keep |
+| `REX_UNDO_RESTART` | `all` | After a server restart: `all` brings back agents and commands, `agents` only agents, `off` nothing |
 | `XDG_CONFIG_HOME`, `XDG_STATE_HOME` | Standard XDG paths | Where `init.lua` and the history live |
 
 ```sh
@@ -58,6 +66,36 @@ The history keeps the last 50 closes, or `REX_UNDO_HISTORY`, with each command l
 it was typed. That includes anything typed into one, such as a token in a `curl` header,
 so `undo_clear` empties both the history and the watcher's log, which names each close.
 Both files are readable only by you.
+
+## After a server restart
+
+A Rex server restart keeps your sessions, tabs, panes, and folders, and ends every program
+in them. Each pane comes back as an empty shell. rex-undo then puts the programs back:
+
+| The pane ran | After the restart |
+| --- | --- |
+| An agent whose conversation is known | `claude --resume ID` (or that agent's command) runs |
+| An agent whose conversation isn't known | Its "continue the latest" command runs, or is only typed if two such agents shared the folder |
+| Any other command, such as `npm run dev` | The command is typed at the prompt. Press Enter to run it |
+| A shell | Nothing |
+
+Two agents in one folder each get their own conversation back, because each pane's
+conversation is recorded separately.
+
+rex-undo types only into a pane that sits at an idle shell, once per server start. It
+clears the prompt first, starts the command with `cd` when the pane is in another folder,
+and leaves a pane alone when its folder is gone or its conversation is already open
+somewhere. What it did, and what it left alone and why, is in
+`~/.local/state/rex-undo/watcher.log`.
+
+It works next to [rexurrect](https://github.com/cemcatik/rexurrect), which restores the
+layout and scrollback by creating the sessions again. rex-undo waits until the sessions
+have stopped changing for 10 seconds, then finds each pane by its session's name and its
+position. A command rexurrect typed into a pane is replaced, not typed twice.
+
+Set `REX_UNDO_RESTART=agents` to bring back only agents, or `off` for nothing. In a
+hand-written `setup{}` call the options are `restart = "all"`, `"agents"`, or `false`, and
+`restart_wait`, the quiet seconds to wait for.
 
 ## How it works
 
@@ -82,6 +120,12 @@ An agent's session ID comes from, in order:
 
 Without an ID, the agent's "continue the latest session here" command runs instead, such
 as `claude --continue` or `codex resume --last`.
+
+For a server restart, the watcher also writes what runs in every pane to `save.json`,
+with the ID of the server it ran on, at most every 5 seconds. A watcher that starts on a
+server with another ID knows the server restarted, and types the saved commands into the
+panes. The save holds the command lines of what runs now, and is readable only by
+you.
 
 ## Agents
 
@@ -110,6 +154,13 @@ restarts with it.
 - fx, amp, goose, and pi share their names with other tools, so one of them counts as
   the agent only when it reports itself to Rex or rex-undo finds its session. Otherwise
   its command reruns as typed, so such an agent can come back in a new session.
+- After a server restart, rex-undo fills the panes that exist; it doesn't create sessions.
+  On a server that starts empty, nothing comes back.
+- A program started in the 5 seconds before the restart can be missing from the save. A
+  save older than 30 days is ignored.
+- When another tool recreates the sessions, a session whose tabs or panes no longer match
+  the save is left alone. rexurrect's snapshot can be 15 minutes old, so that happens after
+  a recent layout change.
 - rex-undo records closes only while the watcher runs. Its log is
   `~/.local/state/rex-undo/watcher.log`.
 - The watcher keeps the code it started with. Run `./install.sh` after pulling changes,
@@ -138,6 +189,13 @@ update rex-undo, run `./install.sh` again instead; it keeps the history.
 ## Contributing
 
 Issues and pull requests are welcome. Run `sh tests/run.sh` before sending a change.
+
+## Credits
+
+rex-undo is by [Lakshay Bhushan](https://github.com/lakshaybhushan/rex-undo-extension).
+This fork adds Linux support, offered upstream, and the restart behavior. The restart
+behavior follows the idea of [rex-durable](https://github.com/fazxes/rex-durable): notice
+a new server by its ID, and type only into idle shells. No code is shared with it.
 
 ## License
 

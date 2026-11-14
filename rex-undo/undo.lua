@@ -5,6 +5,8 @@
 --     rex = "/path/to/rex",        -- the CLI that runs the watcher
 --     key = "cmd+shift+t",         -- false to bind nothing
 --     history = 50,                -- closes to keep
+--     restart = "all",             -- after a server restart: "all", "agents" or false
+--     restart_wait = 10,           -- quiet seconds to wait for before typing
 --   }
 
 local M = {}
@@ -346,10 +348,24 @@ function M.setup(opts)
     rex.log("rex-undo: history must be a whole number, 1 or more; keeping " .. lib.max_entries)
     n = nil
   end
-  if n then
+  if n then lib.max_entries = n end
+
+  local settings = { history = n }
+  local modes = { all = true, agents = true }
+  if opts.restart == false or modes[opts.restart] then
+    settings.restart = opts.restart
+  elseif opts.restart ~= nil then
+    rex.log('rex-undo: restart must be "all", "agents" or false; keeping "all"')
+  end
+  local wait = tonumber(opts.restart_wait)
+  if wait and wait >= 0 then
+    settings.restart_wait = wait
+  elseif opts.restart_wait ~= nil then
+    rex.log("rex-undo: restart_wait must be a number of seconds, 0 or more; keeping the default")
+  end
+  if next(settings) then
     lib.ensure_dirs()
-    lib.write_raw(lib.settings_path, rex.json.encode({ history = n }))
-    lib.max_entries = n
+    lib.write_raw(lib.settings_path, rex.json.encode(settings))
   else
     os.remove(lib.settings_path)
   end
