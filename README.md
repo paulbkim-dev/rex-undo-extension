@@ -15,8 +15,9 @@ After the Rex server restarts, rex-undo also brings back what ran in each pane: 
 agent resumes its own conversation, and any other command is typed at the prompt for you
 to run. See [After a server restart](#after-a-server-restart).
 
-This is a fork of [lakshaybhushan/rex-undo-extension](https://github.com/lakshaybhushan/rex-undo-extension)
-that adds Linux support and the restart behavior. See [Credits](#credits).
+This version began as a fork of [lakshaybhushan/rex-undo-extension](https://github.com/lakshaybhushan/rex-undo-extension)
+and is now developed on its own. It adds Linux support and the restart behavior. See
+[Credits](#credits).
 
 ## Install
 
@@ -193,7 +194,8 @@ Issues and pull requests are welcome. Run `sh tests/run.sh` before sending a cha
 ## Credits
 
 rex-undo is by [Lakshay Bhushan](https://github.com/lakshaybhushan/rex-undo-extension).
-This fork adds Linux support, offered upstream, and the restart behavior. The restart
+This version adds Linux support and the restart behavior, and doesn't follow the
+original's later changes. The restart
 behavior follows the idea of [rex-durable](https://github.com/fazxes/rex-durable): notice
 a new server by its ID, and type only into idle shells. No code is shared with it.
 
