@@ -32,7 +32,8 @@ per copy.
   `rm -f` and `set -C` created it again. Two copies that both found a stale
   pidfile could each remove the other's new file, so both ran.
   `tests/supervisor_test.sh` started 12 copies at once and got 3 to 6 watchers.
-  The fix is a `lockf` kernel lock, which can't go stale. The pidfile is kept
+  The fix is a kernel lock (`lockf` on macOS, `flock` on Linux), which can't go
+  stale. The pidfile is kept
   for `uninstall.sh` and to recognize a copy started before this change.
 
 ## 2. Per-session close tracker (`watcher.lua`: `views`, `closing`)
@@ -116,8 +117,9 @@ the previous agent.
   Test: "a program that only shares an agent's name reruns as itself".
 - **Fixed (low): commands rerun without their quoting.** `args` came from
   `ps -o args=`, which joins argv with spaces, so `grep "a b" f` reran as
-  `grep a b f`. It now comes from the kernel (`bin/rex-undo-argv`, via
-  `KERN_PROCARGS2`) and each word is quoted again; `ps` is the fallback. Test:
+  `grep a b f`. It now comes from the kernel (`/proc/PID/cmdline` on Linux,
+  `bin/rex-undo-argv` via `KERN_PROCARGS2` on macOS) and each word is quoted
+  again; `ps` is the fallback. Test:
   "a command reruns with its quoting".
 - **Fixed (high, regression of the above): a program that renamed itself came
   back unrunnable.** npm, puma, and others write their title over argv, so the
@@ -259,7 +261,47 @@ Absent → Recorded (SessionStart in a pane with a tty, not a subagent; holds
 Overwritten (next SessionStart in that pane) → Deleted (older than 14 days, at
 watcher start). Written via temp file + `mv`, so readers never see half a file.
 
-## 6. Install
+## 6. Restart save (`save.json`, `restart.lua`)
+
+`save.json` holds `{ instance, saved_at, sessions, restored_into }`. `sessions`
+is every session the watcher sees, as
+`{ session_id, label, windows = { { panes = { pane } } } }`, with panes in
+layout order. A pane is `{ block_id, cwd, command, agent, key, idle }`:
+`command` is absent for a shell, `agent` and `key` name an agent and its
+conversation, and `idle` marks a shell at its prompt. The live state the
+watcher plans against has the same shape, so `restart.plan(saved, live, opts)`
+is a function of two values.
+
+Per server instance: Saving (the 5-second loop rewrites the file when the
+sessions changed, or every 10 minutes) → the server restarts, the watcher ends
+and its supervisor starts a new one → NewInstance (`server.status` returns
+another `instance_id` than the save's `instance` and `restored_into`) →
+Marked (`restored_into` is written before anything is typed) → Settling
+(`restoring` is set; no close is recorded and nothing is saved, until no
+session event arrived for `restart_wait` seconds, or 60 seconds passed) →
+Typing (one `write` per planned pane; up to 5 rounds, 2 seconds apart, while a
+matched pane isn't at an idle shell yet) → Saving.
+
+What must hold:
+
+- A pane is typed into at most once per server instance. `restored_into`
+  covers a watcher that stops between Marked and Saving; the `typed` set
+  covers the retry rounds.
+- A conversation is opened at most once: a `key` that runs in a live pane, or
+  was typed in an earlier round, is skipped.
+- Only an agent's command ends in a newline. Every other command stays at the
+  prompt.
+- A saved command with a control character is dropped at save time, since a
+  line break in typed text would run the part before it.
+- A step that fails clears `restoring`, so the watcher goes back to recording
+  closes.
+
+Matching a saved pane to a live one: by block ID, which Rex keeps over a
+restart; else by the session with the same ID; else by a session with the same
+label and the same number of tabs and panes per tab, at the same position.
+Sessions recreated by rexurrect get new IDs and take the last path.
+
+## 7. Install
 
 NotInstalled ⇄ Installed by `install.sh` / `uninstall.sh`. Both are idempotent.
 Partial (one of the two markers) is detected by uninstall and left to the user

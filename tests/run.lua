@@ -490,4 +490,98 @@ test("clear empties the history and says how much it forgot", function()
   assert(undo.history() == "Nothing to reopen", "history still lists entries")
 end)
 
+-- After a server restart -------------------------------------------------------
+
+local restart = dofile(root .. "/rex-undo/restart.lua")
+local function plan(saved, live)
+  return restart.plan({ sessions = saved }, { sessions = live }, {
+    skip = {}, started = {}, exists = function() return true end,
+    quote = function(s) return "'" .. s .. "'" end,
+  })
+end
+local function claude_pane(block, id)
+  return { block_id = block, cwd = "/w", command = "claude --resume " .. id, agent = "claude", key = "claude:" .. id }
+end
+local function shell_pane(block, cwd) return { block_id = block, cwd = cwd or "/w", idle = true } end
+
+test("after a restart, each agent resumes its own conversation and other commands are only typed", function()
+  local saved = { { session_id = "session:1", label = "work", windows = { { panes = {
+    claude_pane("block:a", "1"), claude_pane("block:b", "2"),
+    { block_id = "block:c", cwd = "/w", command = "npm run dev" }, shell_pane("block:d"),
+  } } } } }
+  local live = { { session_id = "session:1", label = "work", windows = { { panes = {
+    shell_pane("block:a"), shell_pane("block:b"), shell_pane("block:c", "/home"), shell_pane("block:d"),
+  } } } } }
+  local writes = plan(saved, live)
+  assert(#writes == 3, "expected 3 writes, got " .. #writes)
+  assert(writes[1].block_id == "block:a" and writes[1].data == "\21claude --resume 1\n", "pane a got " .. writes[1].data)
+  assert(writes[2].block_id == "block:b" and writes[2].data == "\21claude --resume 2\n", "pane b got " .. writes[2].data)
+  assert(writes[3].block_id == "block:c" and writes[3].data == "\21cd '/w' && npm run dev", "pane c got " .. writes[3].data)
+end)
+
+test("after a restart, recreated panes are found by position and an open conversation isn't opened twice", function()
+  local saved = { { session_id = "session:old", label = "work", windows = { { panes = {
+    claude_pane("block:old-a", "1"), claude_pane("block:old-b", "2"),
+  } } } } }
+  local running = claude_pane("block:new-b", "2")
+  local live = { { session_id = "session:new", label = "work", windows = { { panes = {
+    shell_pane("block:new-a"), running,
+  } } } } }
+  local writes, _, notes = plan(saved, live)
+  assert(#writes == 1, "expected 1 write, got " .. #writes)
+  assert(writes[1].session_id == "session:new" and writes[1].block_id == "block:new-a", "wrote to " .. writes[1].block_id)
+  assert(writes[1].data == "\21claude --resume 1\n", "typed " .. writes[1].data)
+  assert(notes[1] and notes[1]:find("already open", 1, true), "no note for the open conversation")
+end)
+
+-- Two idle terminal panes in SID, on a server whose instance is `instance`, and
+-- a save from the server "i1" with a Claude in the first pane and a command in
+-- the second. Returns the list every later write is added to.
+local function restarted_server(instance, settings)
+  local T = "com.superlogical.terminal"
+  local v = view({ "block:t", "block:u" })
+  for _, b in ipairs(v.windows[1].layers[1].blocks) do b.creator_name, b.flavor = T, T .. ".shell" end
+  local writes = {}
+  mock.on_call = function(method)
+    if method == "server.status" then return { instance_id = instance } end
+    return {}
+  end
+  mock.block_call = function(_, method, args)
+    if method == "process" then return { foreground = { pid = 1, name = "zsh", cwd = root } } end
+    if method == "write" then
+      writes[#writes + 1] = args
+      return {}
+    end
+  end
+  lib.ensure_dirs()
+  lib.write_raw(lib.settings_path, rex.json.encode(settings))
+  lib.write_raw(lib.save_path, rex.json.encode({ instance = "i1", saved_at = os.time(), sessions = { {
+    session_id = SID, label = "s", windows = { { panes = {
+      { block_id = "block:t", cwd = root, command = "claude --resume abc", agent = "claude", key = "claude:abc" },
+      { block_id = "block:u", cwd = root, command = "sleep 9999" },
+    } } },
+  } } }))
+  return writes, v
+end
+
+test("the watcher types the saved commands once per server start", function()
+  local writes, v = restarted_server("i2", { restart_wait = 0 })
+  start_watcher(nil, v)
+  assert(#writes == 2, "expected 2 writes, got " .. #writes)
+  assert(writes[1].block_id == "block:t" and writes[1].data == "\21claude --resume abc\n", "pane t got " .. writes[1].data)
+  assert(writes[2].block_id == "block:u" and writes[2].data == "\21sleep 9999", "pane u got " .. writes[2].data)
+  start_watcher(nil, v)
+  assert(#writes == 2, "a second watcher on the same server typed again")
+end)
+
+test("closes while the restart is settling aren't recorded", function()
+  local writes, v = restarted_server("i2", { restart_wait = 3600 })
+  start_watcher(nil, v)
+  mock.handlers.block_closed({ session_id = SID }, {})
+  mock.views[SID] = view({ "block:t" })
+  mock.run_timers()
+  assert(#writes == 0, "typed before the sessions settled")
+  assert(#lib.read_stack() == 0, "recorded a close that wasn't the user's")
+end)
+
 os.exit(failed == 0 and 0 or 1)

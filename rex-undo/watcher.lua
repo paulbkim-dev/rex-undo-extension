@@ -10,6 +10,7 @@ local DIR = os.getenv("REX_UNDO_DIR")
   or "."
 local lib = dofile(DIR .. "/lib.lua")
 local agents = dofile(DIR .. "/agents.lua")
+local restart = dofile(DIR .. "/restart.lua")
 
 local TERMINAL = "com.superlogical.terminal"
 local SHELLS = {
@@ -24,10 +25,17 @@ local INTERPRETERS = {
 -- still running, in case closing the pane hung it up first.
 local RECENT = 3
 local SETTLE = 0.4
+local SAVE_REFRESH = 600
+local SAVE_MAX_AGE = 30 * 86400
+local RESTART_WAIT = 10
+local RESTART_WAIT_MAX = 60
+local RESTART_TRIES = 5
+local RESTART_RETRY = 2
 
 local views = {}    -- session ID -> last session.view
 local blocks = {}   -- block ID -> what we know about the terminal
 local closing = {}  -- session ID -> { view, destroyed, timer }
+local restoring = false
 
 local function each_block(view, fn)
   for _, w in ipairs(view.windows or {}) do
@@ -140,11 +148,30 @@ local function claude_record(block_id, pid)
   return rec
 end
 
+-- Linux keeps each process's argv in /proc. macOS has no /proc, so there the
+-- helper in bin asks the kernel.
+local PROCFS = lib.exists("/proc/self/cmdline")
+
+-- A process's argv, NUL between the words, or "" if it can't be read.
+local function argv_bytes(pid)
+  if not PROCFS then
+    local r = rex.exec({ "perl", DIR .. "/../bin/rex-undo-argv", tostring(pid) }, { timeout = 3 })
+    return (r and r.ok and r.stdout) or ""
+  end
+  local f = io.open("/proc/" .. tostring(pid) .. "/cmdline", "r")
+  if not f then return "" end
+  local s = f:read("*a") or ""
+  f:close()
+  -- /proc ends every word with a NUL, the last one too.
+  if s:sub(-1) == "\0" then s = s:sub(1, -2) end
+  return s
+end
+
 -- The command line, quoted again so it reruns with the same words.
 local function command_line(pid)
-  local r = rex.exec({ "perl", DIR .. "/../bin/rex-undo-argv", tostring(pid) }, { timeout = 3 })
-  if r and r.ok and r.stdout ~= "" then
-    local raw, s, i = {}, r.stdout .. "\0", 1
+  local bytes = argv_bytes(pid)
+  if bytes ~= "" then
+    local raw, s, i = {}, bytes .. "\0", 1
     while i <= #s do
       local j = s:find("\0", i, true)
       raw[#raw + 1] = s:sub(i, j - 1)
@@ -173,8 +200,8 @@ local function command_line(pid)
     end
     return table.concat(words, " ")
   end
-  -- Loses quoting, but better than nothing if perl can't read it.
-  r = rex.exec({ "ps", "-o", "args=", "-p", tostring(pid) }, { timeout = 3 })
+  -- Loses quoting, but better than nothing if argv can't be read.
+  local r = rex.exec({ "ps", "-o", "args=", "-p", tostring(pid) }, { timeout = 3 })
   if r and r.ok then return (r.stdout:gsub("%s+$", "")) end
 end
 
@@ -313,7 +340,8 @@ local function names_session(args)
   return false
 end
 
--- The command that brings the program back, and a short description of it.
+-- The command that brings the program back, a short description of it, and
+-- for an agent whose conversation is known, a name for that conversation.
 local function command_for(fg)
   local a = find_agent(fg)
   if not a then
@@ -327,9 +355,10 @@ local function command_for(fg)
   end
   if fg.session_id and a.resume then
     local id = fg.session_id
-    return (a.resume:gsub("{id}", function() return shquote(id) end)), name .. " " .. id:sub(1, 12)
+    return (a.resume:gsub("{id}", function() return shquote(id) end)), name .. " " .. id:sub(1, 12),
+      name .. ":" .. id
   end
-  if names_session(fg.args) then return fg.args, fg.args end
+  if names_session(fg.args) then return fg.args, fg.args, fg.args end
   if a.continue then return a.continue, name .. " (latest here)" end
   return fg.args or name, fg.args or name
 end
@@ -480,6 +509,9 @@ end
 -- Recording closes -------------------------------------------------------------
 
 local function record(entry)
+  -- rexurrect closes the sessions Rex carried over and creates its own; those
+  -- closes aren't the user's.
+  if restoring then return end
   entry.closed_at = os.time()
   lib.push(entry)
   print(os.date("%H:%M:%S") .. " recorded " .. entry.summary)
@@ -622,10 +654,133 @@ function on_close(sid, destroyed)
   mark_settling()
 end
 
+-- After a server restart ---------------------------------------------------------
+
+local function pane_state(b)
+  local pane = { block_id = b.block_id }
+  local info = blocks[b.block_id]
+  if b.creator_name ~= TERMINAL or not (info and info.fg) then return pane end
+  pane.cwd = info.cwd
+  if is_shell(info.fg) then
+    pane.idle = true
+    return pane
+  end
+  local cmd, _, key = command_for(info.fg)
+  -- A line break inside a typed command would run the part before it.
+  if cmd:find("%c") then return pane end
+  local a = find_agent(info.fg)
+  pane.command, pane.key, pane.agent = cmd, key, a and a.names[1] or nil
+  if a and info.fg.cwd then pane.cwd = info.fg.cwd end
+  return pane
+end
+
+local function snapshot()
+  local sessions = {}
+  for sid, view in pairs(views) do
+    local windows = {}
+    for _, w in ipairs(view.windows or {}) do
+      local panes = {}
+      for _, l in ipairs(w.layers or {}) do
+        local by_id = {}
+        for _, b in ipairs(l.blocks or {}) do by_id[b.block_id] = b end
+        for _, bid in ipairs(l.layout and blocks_in(l.layout, {}) or {}) do
+          panes[#panes + 1] = pane_state(by_id[bid] or { block_id = bid })
+        end
+      end
+      windows[#windows + 1] = { panes = panes }
+    end
+    sessions[#sessions + 1] = { session_id = sid, label = view.label, windows = windows }
+  end
+  table.sort(sessions, function(a, b) return a.session_id < b.session_id end)
+  return sessions
+end
+
+local instance
+local saved_text, saved_at = nil, 0
+local last_change = os.time()
+
+local function save()
+  if not instance or restoring then return end
+  local sessions, now = snapshot(), os.time()
+  local text = rex.json.encode(sessions)
+  if text == saved_text and now - saved_at < SAVE_REFRESH then return end
+  lib.write_raw(lib.save_path, rex.json.encode({ instance = instance, saved_at = now, sessions = sessions }))
+  saved_text, saved_at = text, now
+end
+
+local function stamp() return os.date("%H:%M:%S") .. " restart: " end
+
+-- A restore that fails must not leave the watcher recording no closes.
+local function restoring_step(fn)
+  return function()
+    local ok, err = pcall(fn)
+    if not ok then
+      restoring = false
+      error(err, 0)
+    end
+  end
+end
+
+local function type_saved(saved, mode, typed, started, try)
+  scan(true)
+  local writes, busy, notes = restart.plan(saved, { sessions = snapshot() }, {
+    programs = mode ~= "agents", skip = typed, started = started, exists = lib.exists, quote = shquote,
+  })
+  for _, w in ipairs(writes) do
+    local ok = rex.block.call(TERMINAL, "write",
+      { session_id = w.session_id, block_id = w.block_id, data = w.data })
+    typed[w.block_id] = true
+    if w.key then started[w.key] = true end
+    print(stamp() .. (ok and (w.run and "ran in " or "typed in ") or "couldn't type in ") .. w.where .. ": " .. w.command)
+  end
+  if busy > 0 and try < RESTART_TRIES then
+    rex.after(RESTART_RETRY, restoring_step(function() type_saved(saved, mode, typed, started, try + 1) end))
+    return
+  end
+  for _, note in ipairs(notes) do print(stamp() .. "left alone " .. note) end
+  restoring = false
+  save()
+end
+
+local function begin_restart()
+  local status = rex.call("server.status")
+  instance = status and status.instance_id
+  if not instance then return end
+  local saved = lib.read_json(lib.save_path)
+  if type(saved) ~= "table" or saved.instance == instance or saved.restored_into == instance then return end
+  -- Marked before anything is typed, so a watcher that stops halfway and
+  -- starts again doesn't type a second time.
+  saved.restored_into = instance
+  lib.write_raw(lib.save_path, rex.json.encode(saved))
+  local settings = lib.read_json(lib.settings_path)
+  if type(settings) ~= "table" then settings = {} end
+  if settings.restart == false or os.time() - (tonumber(saved.saved_at) or 0) > SAVE_MAX_AGE then return end
+
+  restoring = true
+  local wait, began = tonumber(settings.restart_wait) or RESTART_WAIT, os.time()
+  local check
+  check = restoring_step(function()
+    local now = os.time()
+    -- rexurrect replaces the sessions Rex carried over in the first seconds.
+    -- Typing before it finishes would go into panes it then closes.
+    if now - last_change < wait and now - began < RESTART_WAIT_MAX then
+      rex.after(1, check)
+      return
+    end
+    print(stamp() .. "the server restarted; bringing back what ran before")
+    type_saved(saved, settings.restart, {}, {}, 1)
+  end)
+  check()
+end
+
 -- Events -------------------------------------------------------------------------
 
-rex.on("session_view_changed", function(ctx) refresh(ctx.session_id) end)
+rex.on("session_view_changed", function(ctx)
+  last_change = os.time()
+  refresh(ctx.session_id)
+end)
 rex.on("session_created", function(ctx, ev)
+  last_change = os.time()
   refresh((ev.session and ev.session.session_id) or ctx.session_id)
 end)
 
@@ -657,6 +812,7 @@ end)
 rex.on("block_closed", function(ctx, ev) on_close(ev.session_id or ctx.session_id) end)
 rex.on("window_closed", function(ctx, ev) on_close(ev.session_id or ctx.session_id) end)
 rex.on("session_destroyed", function(ctx, ev)
+  last_change = os.time()
   on_close(ev.session_id or ctx.session_id, true)
 end)
 
@@ -667,6 +823,7 @@ rex.after(0, function()
   rex.exec({ "find", lib.claude_dir, "-name", "*.json", "-mtime", "+14", "-delete" })
   scan(true)
   print(os.date("%H:%M:%S") .. " watching")
+  begin_restart()
 end)
 -- A safety net for process changes an event didn't report. It probes the
 -- cached views rather than reading new ones, so it can't replace the snapshot
@@ -677,4 +834,5 @@ rex.every(5, function()
       each_block(view, function(b) probe(sid, b) end)
     end
   end
+  save()
 end)
